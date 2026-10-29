@@ -17,6 +17,9 @@ BLOCK = 15                 # 수요전력 산정 단위 (분)
 # 피크 한계값 = 전년도 동절기 15분 평균 최대 수요 (데이터에 전년도 동절기가 없으면 이번 동절기 최대로 임시 대체)
 P_WARN_KW = 3096.0         # P_warn 고정값 (kW). 예상 수요가 이 값 이상 -> WARNING (유연부하 제어 시작)
 WARN_RATIO = 0.90          # P_WARN_KW = None 이면 P_warn = 한계값 x 90%
+# P_peak 범위 (팀 문서 '인수인계_P값_설정방식.md' 5절, 2024 겨울 = 전년도 기준 값. 그래프 표시용)
+P_PEAKMAX_KW = 3107.0      # P_peak max: 최대이익의 90% 이상이 유지되는 얕은 쪽 경계
+P_PEAKMIN_KW = 3101.5      # P_peak min: 이익이 급락(절벽)하기 직전의 깊은 쪽 경계
 EMERG_RATIO = 1.00         # 한계값 100% 이상 -> EMERGENCY (유연 + 탄력 제어)
 SMOOTH_MIN = 3             # 예상 수요 계산에 쓰는 최근 전력 평균 (분) - 1분 출렁임 완화
 WINDOW_MIN = 60            # 1분 그래프에 보여줄 최근 분 수
@@ -399,16 +402,24 @@ def main():
         st.error(f"❌ 데이터 로드 실패: {e}")
         st.stop()
 
+    # ---- 링크로 시연 장면 바로 열기: 주소 끝에 ?demo=peak (선택: &step=분) ----
+    qp = st.query_params
+    if qp.get("demo") == "peak" and ss.get("demo_applied") != data_file:
+        ss.demo_applied = data_file
+        ss["scenario"] = "피크 구간 (자동)"
+        ss.anchor = bundle["peak_idx"]
+        ss.current_step = int(qp.get("step", 35))
+
     ts, P, names, ai_types = bundle["ts"], bundle["P"], bundle["cols"], bundle["types"]
     mib, ends, limit, unit = bundle["mib"], bundle["ends"], bundle["limit"], UNIT
     season, feats = bundle["season"], bundle["features"]
 
     st.title("⚡ Peak-Cut 실시간 관제 & 통합 제어 대시보드")
-    st.caption(
-        f"데이터: {', '.join(bundle['files'])} · 관제 기간: {season} "
+    st.caption((  # '~'는 마크다운 취소선이 되므로 이스케이프 (파일명은 사이드바에 표시)
+        f"관제 기간: {season} "
         f"{ts[0].strftime('%Y-%m-%d')} ~ {ts[-1].strftime('%Y-%m-%d')} (1분 데이터) · 설비 {len(names)}개 · "
         f"단위 {unit} · 수요전력은 한전 방식(15분 평균) 기준으로 판단"
-    )
+    ).replace("~", "\\~"))
 
     st.sidebar.success(f"✅ 파일 {len(bundle['files'])}개 · 관제 {season} {len(ts):,}분 · 설비 {len(names)}개")
     if bundle["check_err"] is not None:
@@ -443,8 +454,9 @@ def main():
     st.sidebar.metric("🔒 피크 한계값 (전년도 동절기 15분 최대)", f"{limit:,.0f} {unit}")
     pw = p_warn(limit)
     pw_note = "고정값" if P_WARN_KW is not None else "한계값의 90%"
-    st.sidebar.caption(f"P_warn = {pw:,.0f} {unit} ({pw_note}, 한계값의 {pw / limit * 100:.1f}%) · "
-                       f"한계값 기준: {bundle['limit_src']}")
+    st.sidebar.caption((f"P_warn = {pw:,.0f} {unit} ({pw_note}, 한계값의 {pw / limit * 100:.1f}%) · "
+                        f"한계값 기준: {bundle['limit_src']} · "
+                        f"P_peak 범위 {P_PEAKMIN_KW:,.1f} ~ {P_PEAKMAX_KW:,.1f} {unit}").replace("~", "\\~"))
     if bundle["limit_fallback"]:
         st.sidebar.warning("전년도 동절기 데이터가 없어 이번 동절기 최대값을 임시 한계값으로 사용 중입니다.")
     speed = st.sidebar.slider("재생 속도 (초/분)", min_value=0.05, max_value=2.0, value=0.2)
@@ -579,10 +591,15 @@ def main():
         fig.add_trace(go.Scatter(x=x, y=res["ctrl"][lo:], mode="lines", name="제어 후 전력 (1분)",
                                  line=dict(color="green", width=2, dash="dash")))
         fig.add_hline(y=limit, line_dash="solid", line_color="black",
-                      annotation_text=f"한계값 {limit:,.0f} (15분 평균 기준)")
+                      annotation_text=f"P_max {limit:,.0f} (15분 평균 기준)")
         fig.add_hline(y=pw, line_dash="dot", line_color="orange",
                       annotation_text=f"P_warn {pw:,.0f}",
                       annotation_position="bottom right")
+        # P_peak max/min은 서로 5kW 차이라 글씨가 겹치므로 범례로 표시
+        for val, name, color in ((P_PEAKMAX_KW, "P_peak max", "purple"),
+                                 (P_PEAKMIN_KW, "P_peak min", "deepskyblue")):
+            fig.add_trace(go.Scatter(x=x, y=[val] * len(x), mode="lines", name=f"{name} {val:,.1f}",
+                                     line=dict(color=color, width=1.5, dash="dot"), hoverinfo="skip"))
         fig.update_layout(title="📈 1분 전력 추이 (최근 60분)", xaxis_title="시각",
                           yaxis_title=f"전력 ({unit})", height=330)
         st.plotly_chart(fig, use_container_width=True)
@@ -610,12 +627,19 @@ def main():
     fig_b = go.Figure()
     fig_b.add_trace(go.Bar(x=labels, y=raw_m, name="제어 전 15분 수요", marker_color="red"))
     fig_b.add_trace(go.Bar(x=labels, y=ctrl_m, name="제어 후 15분 수요", marker_color="green"))
+    # P_peak range: 폭이 5.5kW라 얇으므로 막대 위에 반투명으로 칠하고, 이름은 P_warn 글씨와 겹치지 않게 범례로 표시
+    fig_b.add_hrect(y0=P_PEAKMIN_KW, y1=P_PEAKMAX_KW, fillcolor="rgba(147, 112, 219, 0.55)", line_width=0,
+                    layer="above")
+    fig_b.add_trace(go.Scatter(x=[None], y=[None], mode="markers", hoverinfo="skip",
+                               marker=dict(symbol="square", size=14, color="rgba(147, 112, 219, 0.55)"),
+                               name=f"P_peak range {P_PEAKMIN_KW:,.1f}~{P_PEAKMAX_KW:,.1f}"))
     fig_b.add_hline(y=limit, line_dash="solid", line_color="black",
-                    annotation_text="한계값 = Emergency (100%)")
+                    annotation_text=f"P_max {limit:,.0f}")
     fig_b.add_hline(y=pw, line_dash="dot", line_color="orange",
-                    annotation_text=f"P_warn = Warning ({pw:,.0f})", annotation_position="bottom left")
+                    annotation_text=f"P_warn {pw:,.0f}", annotation_position="bottom left")
+    y_top = max([limit] + raw_m + ctrl_m) * 1.01  # P_max 선이 보이도록 1% 여유, 넘는 막대가 있으면 그만큼 확장
     fig_b.update_layout(title="📊 15분 구간 수요전력 (요금 산정 기준, 진행 중 구간은 현재까지 평균)",
-                        barmode="group", yaxis_title=f"전력 ({unit})", height=330)
+                        barmode="group", yaxis_title=f"전력 ({unit})", yaxis_range=[2500, y_top], height=330)
     st.plotly_chart(fig_b, use_container_width=True)
 
     # ---- 의사결정 로그 ----
