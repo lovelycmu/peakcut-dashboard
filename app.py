@@ -867,64 +867,67 @@ def main():
             cols_s[-1].metric("기본요금 절감 (연, 제어 비용 미반영)", f"{r['saving_won'] / 1e4:,.0f} 만원")
 
     # ---- 부하 구성비 시나리오 ----
-    with st.expander("⚖️ 부하 구성비 시나리오: 경직·탄력·유연 비율을 바꾸면 절감액이 어떻게 달라지나 (계산에 수십 초 소요)"):
+    with st.expander("⚖️ 부하 구성비 시나리오: 경직은 그대로, 유연 ↔ 주기탄력 비율을 옮기면 몇 kW 줄어드나 (계산에 수십 초 소요)"):
         cur = type_shares(P, names, types)
+        movable = cur[FLEX] + cur[ELASTIC]  # 경직을 뺀 나머지 = 유연 + 주기탄력 (이 합은 고정)
         st.caption(
             f"현재 구성비(관리자 확정 유형, 에너지 기준): 경직 {cur[RIGID] * 100:.1f}% · "
-            f"탄력 {cur[ELASTIC] * 100:.1f}% · 유연 {cur[FLEX] * 100:.1f}%. "
-            "방법: 유형별로 1분 전력에 같은 계수를 곱해 목표 비율로 맞춘 '가상 공장'을 만든다 "
-            "(총 에너지·시간 패턴 유지). 전년도 데이터도 같은 계수로 바꿔 P_max를 다시 정하고, "
-            "P_warn은 P_max 대비 비율을 유지한다."
+            f"주기탄력 {cur[ELASTIC] * 100:.1f}% · 유연 {cur[FLEX] * 100:.1f}%. "
+            "부하 분류 방법은 그대로 두고, 경직 비율을 고정한 채 유연과 주기탄력 사이에서만 비율을 옮긴다. "
+            "유형별로 1분 전력에 같은 계수를 곱해 맞추므로 총 에너지·시간 패턴은 그대로이고, "
+            "전년도 데이터도 같은 계수로 바꿔 P_max를 다시 정하며 P_warn은 P_max 대비 비율을 유지한다."
         )
-        r1, r2 = st.columns(2)
-        f_pct = r1.slider("유연부하 비율 (%)", 0, 60, int(round(cur[FLEX] * 100)), 1, key="ratio_flex")
-        e_pct = r2.slider("탄력부하 비율 (%)", 0, 40, int(round(cur[ELASTIC] * 100)), 1, key="ratio_elastic")
-        g_pct = 100 - f_pct - e_pct
-        if g_pct < 0:
-            st.error("유연 + 탄력이 100%를 넘습니다.")
-        else:
-            st.write(f"→ 경직부하 비율 **{g_pct}%**")
-            deep = st.checkbox("P_warn을 25kW씩 낮추며 최대 감축 여력까지 계산 (약 1~2분)", key="ratio_deep")
-            scen = (("현재 구성", cur),
-                    ("시나리오", {RIGID: g_pct / 100, ELASTIC: e_pct / 100, FLEX: f_pct / 100}))
-            if st.button("시나리오 계산", key="ratio_run"):
-                rows = []
-                for nm, sh in scen:
-                    r = ratio_scenario(bundle, names, types, order, flex_set, greedy, flex_min, sh)
-                    rows.append({
-                        "구분": nm,
-                        "경직·탄력·유연(%)": f"{sh[RIGID] * 100:.0f} · {sh[ELASTIC] * 100:.0f} · {sh[FLEX] * 100:.0f}",
-                        f"P_max({unit})": round(r["limit"], 1),
-                        f"P_warn({unit})": round(r["warn"], 1),
-                        f"무제어 최대({unit})": round(r["raw_max"], 1),
-                        f"제어 후 최대({unit})": round(r["ctrl_max"], 1),
-                        f"감축({unit})": round(r["raw_max"] - r["ctrl_max"], 1),
-                        "기본요금 절감(만원/년)": round(r["saving_won"] / 1e4),
-                        f"유연 최대 감속 시 최대({unit})": round(r["floor_max"], 1),
-                        "감축 에너지(kWh)": round(r["energy_cut_kwh"]),
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                st.caption("'유연 최대 감속 시 최대' = 자동제어 대상 유연부하를 항상 최소 가동률로 돌렸을 때의 15분 최대 "
-                           "(탄력 지연 제외). P_warn보다 크면 유연부하만으로는 P_warn을 지킬 수 없다는 뜻. "
-                           "절감액은 기본요금만 계산했고 생산 손실·보충 작업 비용은 넣지 않았다.")
-                if deep:
-                    fig_r = go.Figure()
-                    best_rows = []
-                    for (nm, sh), color in zip(scen, ("gray", "royalblue")):
-                        pts, raw_max, lim = depth_sweep(bundle, names, types, order, flex_set, greedy, flex_min, sh)
-                        xs = [p[0] for p in pts]
-                        save = [(raw_max - p[2]) * FEE_WON_PER_KW_YEAR / 1e4 for p in pts]
-                        fig_r.add_trace(go.Scatter(x=xs, y=save, mode="lines+markers", name=nm,
-                                                   line=dict(color=color, width=2)))
-                        k = int(np.argmax(save))
-                        best_rows.append({"구분": nm, f"최적 감축 목표({unit})": xs[k],
-                                          f"그때 제어 후 최대({unit})": round(pts[k][2], 1),
-                                          "기본요금 절감 상한(만원/년)": round(save[k])})
-                    fig_r.update_layout(title="P_warn 깊이별 기본요금 절감액 (제어 비용 미반영)",
-                                        xaxis_title=f"감축 목표 = P_max − P_warn ({unit})",
-                                        yaxis_title="만원/년", height=360)
-                    st.plotly_chart(fig_r, use_container_width=True)
-                    st.dataframe(pd.DataFrame(best_rows), use_container_width=True, hide_index=True)
+        cur_pct = int(round(cur[FLEX] / movable * 100)) if movable > 0 else 50
+        f_in = st.slider(
+            f"◀ 주기탄력 많게  ·  유연 많게 ▶   (유연 + 주기탄력 {movable * 100:.1f}% 중 유연부하 몫, %)",
+            0, 100, cur_pct, 1, key="ratio_split",
+            help="드래그해서 유연부하와 주기탄력 부하의 비율을 옮깁니다. 경직성 부하 비율은 바뀌지 않습니다.",
+        )
+        f_sh = movable * f_in / 100
+        e_sh = movable - f_sh
+        st.write(f"→ 경직 **{cur[RIGID] * 100:.1f}%** (고정) · 주기탄력 **{e_sh * 100:.1f}%** · 유연 **{f_sh * 100:.1f}%**")
+        deep = st.checkbox("P_warn을 25kW씩 낮추며 최대 감축 kW까지 계산 (약 1~2분)", key="ratio_deep")
+        scen = (("현재 구성", cur),
+                ("시나리오", {RIGID: cur[RIGID], ELASTIC: e_sh, FLEX: f_sh}))
+        if st.button("시나리오 계산", key="ratio_run"):
+            rows = []
+            for nm, sh in scen:
+                r = ratio_scenario(bundle, names, types, order, flex_set, greedy, flex_min, sh)
+                rows.append({
+                    "구분": nm,
+                    "경직·주기탄력·유연(%)": f"{sh[RIGID] * 100:.1f} · {sh[ELASTIC] * 100:.1f} · {sh[FLEX] * 100:.1f}",
+                    f"P_max({unit})": round(r["limit"], 1),
+                    f"P_warn({unit})": round(r["warn"], 1),
+                    f"무제어 최대({unit})": round(r["raw_max"], 1),
+                    f"제어 후 최대({unit})": round(r["ctrl_max"], 1),
+                    f"감축({unit})": round(r["raw_max"] - r["ctrl_max"], 1),
+                    "기본요금 절감(만원/년)": round(r["saving_won"] / 1e4),
+                    f"유연 최대 감속 시 최대({unit})": round(r["floor_max"], 1),
+                    "감축 에너지(kWh)": round(r["energy_cut_kwh"]),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption("'유연 최대 감속 시 최대' = 자동제어 대상 유연부하를 항상 최소 가동률로 돌렸을 때의 15분 최대 "
+                       "(탄력 지연 제외). P_warn보다 크면 유연부하만으로는 P_warn을 지킬 수 없다는 뜻. "
+                       "절감액은 기본요금만 계산했고 생산 손실·보충 작업 비용은 넣지 않았다.")
+            if deep:
+                fig_r = go.Figure()
+                best_rows = []
+                for (nm, sh), color in zip(scen, ("gray", "royalblue")):
+                    pts, raw_max, lim = depth_sweep(bundle, names, types, order, flex_set, greedy, flex_min, sh)
+                    xs = [p[0] for p in pts]
+                    cut_kw = [raw_max - p[2] for p in pts]
+                    fig_r.add_trace(go.Scatter(x=xs, y=cut_kw, mode="lines+markers", name=nm,
+                                               line=dict(color=color, width=2)))
+                    k = int(np.argmax(cut_kw))
+                    best_rows.append({"구분": nm, f"P_warn 깊이({unit})": xs[k],
+                                      f"그때 제어 후 최대({unit})": round(pts[k][2], 1),
+                                      f"최대 감축({unit})": round(cut_kw[k], 1),
+                                      "기본요금 절감 상한(만원/년)": round(cut_kw[k] * FEE_WON_PER_KW_YEAR / 1e4)})
+                fig_r.update_layout(title="P_warn 깊이별 피크 감축량 (무제어 최대 − 제어 후 최대)",
+                                    xaxis_title=f"P_warn 깊이 = P_max − P_warn ({unit})",
+                                    yaxis_title=f"감축 ({unit})", height=360)
+                st.plotly_chart(fig_r, use_container_width=True)
+                st.dataframe(pd.DataFrame(best_rows), use_container_width=True, hide_index=True)
 
     # ---- 재생 루프 ----
     if ss.is_running:
