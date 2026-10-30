@@ -1,6 +1,5 @@
 import os
 import re
-import time
 
 import numpy as np
 import pandas as pd
@@ -364,10 +363,158 @@ def winter_summary(bundle, order, flex_set, greedy):
 
 
 # ============================================================
+# 3-1. 실시간 패널 (재생 중에는 이 부분만 다시 그림 -> 깜빡임 방지)
+# ============================================================
+def live_panel(ts, P, mib, names, types, order, flex_set, manual_mask, limit, greedy,
+               start_idx, max_step, pw, rank_of, unit):
+    """상태 배너 / 지표 / 그래프 3개 / 의사결정 로그.
+
+    st.fragment(run_every=재생 속도)로 감싸서 호출하므로, 재생 중에는 앱 전체가 아니라
+    이 함수 안의 요소만 주기적으로 다시 그린다 (사이드바·표·토글은 그대로).
+    """
+    ss = st.session_state
+    # ---- 시뮬레이션 ----
+    step = min(ss.current_step, max_step)
+    end = start_idx + step
+    res = simulate(
+        P[start_idx:end + 1], mib[start_idx:end + 1], order, flex_set, manual_mask, limit, greedy
+    )
+    t_now = ts[end].strftime("%Y-%m-%d %H:%M")
+    status = int(res["status"][-1])
+    ratio_dec = res["d_dec"][-1] / limit * 100
+    raw_now = res["raw"][-1]
+    cut_now = res["cut"][-1]
+
+    how = " (우선순위대로 P_warn 아래까지)" if greedy else " (대상 전부)"
+    if status == 0:
+        st.success(f"🟢 **[{t_now} 정상]** 이번 15분 구간 예상 수요율 {ratio_dec:.1f}% - 개입 없음")
+    elif status == 1:
+        st.warning(f"🟡 **[{t_now} 경고]** 예상 수요율 {ratio_dec:.1f}% (≥ P_warn {pw:,.0f}{unit}) - 유연부하 차단{how}")
+    else:
+        st.error(
+            f"🔴 **[{t_now} 비상]** 예상 수요율 {ratio_dec:.1f}% (≥100% 한계값) - 유연부하 차단 + 탄력부하 15분 지연{how}"
+        )
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("현재 전력 (1분)", f"{raw_now:,.0f} {unit}")
+    c2.metric("피크 한계값", f"{limit:,.0f} {unit}")
+    c3.metric(
+        "구간 예상 수요 (무제어)", f"{res['proj_raw'][-1]:,.0f} {unit}",
+        delta=f"{res['proj_raw'][-1] / limit * 100:.0f}% of 한계",
+        delta_color="off",
+    )
+    c4.metric(
+        "구간 예상 수요 (제어 후)", f"{res['proj_ctrl'][-1]:,.0f} {unit}",
+        delta=f"{res['proj_ctrl'][-1] / limit * 100:.0f}% of 한계",
+        delta_color="off",
+    )
+    c5.metric(
+        "현재 감축 전력", f"{cut_now:,.0f} {unit}",
+        delta=f"-{cut_now:,.0f} {unit}" if cut_now > 0 else None,
+    )
+
+    # ---- 그래프 ----
+    col_chart, col_gauge = st.columns([2, 1])
+    with col_chart:
+        lo = max(0, len(res["raw"]) - WINDOW_MIN)
+        x = list(ts[start_idx + lo:end + 1])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=res["raw"][lo:], mode="lines", name="측정 전력 (1분)",
+                                 line=dict(color="red", width=2)))
+        fig.add_trace(go.Scatter(x=x, y=res["ctrl"][lo:], mode="lines", name="제어 후 전력 (1분)",
+                                 line=dict(color="green", width=2, dash="dash")))
+        fig.add_hline(y=limit, line_dash="solid", line_color="black",
+                      annotation_text=f"P_max {limit:,.0f} (15분 평균 기준)")
+        fig.add_hline(y=pw, line_dash="dot", line_color="orange",
+                      annotation_text=f"P_warn {pw:,.0f}",
+                      annotation_position="bottom right")
+        # P_peak max/min은 서로 5kW 차이라 글씨가 겹치므로 범례로 표시
+        for val, name, color in ((P_PEAKMAX_KW, "P_peak max", "purple"),
+                                 (P_PEAKMIN_KW, "P_peak min", "deepskyblue")):
+            fig.add_trace(go.Scatter(x=x, y=[val] * len(x), mode="lines", name=f"{name} {val:,.1f}",
+                                     line=dict(color=color, width=1.5, dash="dot"), hoverinfo="skip"))
+        fig.update_layout(title="📈 1분 전력 추이 (최근 60분)", xaxis_title="시각",
+                          yaxis_title=f"전력 ({unit})", height=330)
+        st.plotly_chart(fig, use_container_width=True, key="live_line")
+
+    with col_gauge:
+        val = float(res["proj_raw"][-1])
+        gmax = max(limit * 1.2, val * 1.1)
+        fig_g = go.Figure(go.Indicator(
+            mode="gauge+number", value=val,
+            gauge={
+                "axis": {"range": [0, gmax]},
+                "bar": {"color": "darkblue"},
+                "steps": [
+                    {"range": [0, pw], "color": "lightgreen"},
+                    {"range": [pw, limit * EMERG_RATIO], "color": "yellow"},
+                    {"range": [limit * EMERG_RATIO, gmax], "color": "salmon"},
+                ],
+                "threshold": {"line": {"color": "red", "width": 4}, "value": limit},
+            },
+        ))
+        fig_g.update_layout(title="구간 예상 수요 (무제어 기준)", height=330)
+        st.plotly_chart(fig_g, use_container_width=True, key="live_gauge")
+
+    labels, raw_m, ctrl_m = block_series(res, mib[start_idx:end + 1], ts[start_idx:end + 1], WINDOW_BLOCKS)
+    fig_b = go.Figure()
+    fig_b.add_trace(go.Bar(x=labels, y=raw_m, name="제어 전 15분 수요", marker_color="red"))
+    fig_b.add_trace(go.Bar(x=labels, y=ctrl_m, name="제어 후 15분 수요", marker_color="green"))
+    # P_peak range: 폭이 5.5kW라 얇으므로 막대 위에 반투명으로 칠하고, 이름은 P_warn 글씨와 겹치지 않게 범례로 표시
+    fig_b.add_hrect(y0=P_PEAKMIN_KW, y1=P_PEAKMAX_KW, fillcolor="rgba(147, 112, 219, 0.55)", line_width=0,
+                    layer="above")
+    fig_b.add_trace(go.Scatter(x=[None], y=[None], mode="markers", hoverinfo="skip",
+                               marker=dict(symbol="square", size=14, color="rgba(147, 112, 219, 0.55)"),
+                               name=f"P_peak range {P_PEAKMIN_KW:,.1f}~{P_PEAKMAX_KW:,.1f}"))
+    fig_b.add_hline(y=limit, line_dash="solid", line_color="black",
+                    annotation_text=f"P_max {limit:,.0f}")
+    fig_b.add_hline(y=pw, line_dash="dot", line_color="orange",
+                    annotation_text=f"P_warn {pw:,.0f}", annotation_position="bottom left")
+    y_top = max([limit] + raw_m + ctrl_m) * 1.01  # P_max 선이 보이도록 1% 여유, 넘는 막대가 있으면 그만큼 확장
+    fig_b.update_layout(title="📊 15분 구간 수요전력 (요금 산정 기준, 진행 중 구간은 현재까지 평균)",
+                        barmode="group", yaxis_title=f"전력 ({unit})", yaxis_range=[2500, y_top], height=330)
+    st.plotly_chart(fig_b, use_container_width=True, key="live_bar")
+
+    # ---- 의사결정 로그 ----
+    st.subheader("🤖 수동 조작 및 AI 실시간 의사결정 로그 (현재 시점)")
+    p_now = P[end]
+    rows = []
+    for i, c in enumerate(names):
+        if manual_mask[i] and p_now[i] > 0:
+            rows.append(["-", c, "OFF (수동 차단)", "수동 개입", round(p_now[i], 1), round(p_now[i], 1),
+                         "관리자 수동 차단"])
+    for i, kind, r in res["actions"]:
+        label, why = ACTION_TEXT[kind]
+        rows.append([str(rank_of[i]), names[i], label, types[names[i]], round(p_now[i], 1), round(r, 1), why])
+    if rows:
+        df_act = pd.DataFrame(
+            rows, columns=["순위", "대상 설비", "제어 상태", "부하 유형", f"현재 전력({unit})",
+                           f"감축량({unit})", "제어 사유"]
+        )
+        st.dataframe(df_act, use_container_width=True, hide_index=True)
+    else:
+        st.info("현재 제어 중인 설비가 없습니다.")
+
+
+    # ---- 재생: 다음 갱신 때 1분 전진 (time.sleep / 앱 전체 st.rerun 없음) ----
+    if ss.is_running:
+        if ss.current_step < max_step:
+            ss.current_step += 1
+        else:
+            ss.is_running = False
+            st.rerun()  # 끝에 도달하면 앱 전체를 한 번만 다시 실행해 자동 갱신을 멈춤
+
+
+# ============================================================
 # 3. 대시보드
 # ============================================================
 def main():
     st.set_page_config(page_title="Peak-Cut 실시간 관제 대시보드", page_icon="⚡", layout="wide")
+    # 갱신 중 요소가 반투명해지는 효과 끄기 (깜빡임 보조 대책)
+    st.markdown(
+        "<style>[data-stale='true']{opacity:1 !important; transition:none !important;}</style>",
+        unsafe_allow_html=True,
+    )
 
     # ---- 세션 상태 ----
     ss = st.session_state
@@ -540,127 +687,11 @@ def main():
             st.toggle(f"{names[i]} ({types[names[i]]})", value=True, key=f"sw_{names[i]}")
     manual_mask = np.array([not ss.get(f"sw_{c}", True) for c in names], dtype=bool)
 
-    # ---- 시뮬레이션 ----
-    step = min(ss.current_step, max_step)
-    end = start_idx + step
-    res = simulate(
-        P[start_idx:end + 1], mib[start_idx:end + 1], order, flex_set, manual_mask, limit, greedy
+    # ---- 실시간 패널: 재생 중에는 이 부분만 speed초마다 다시 그림 ----
+    st.fragment(live_panel, run_every=speed if ss.is_running else None)(
+        ts, P, mib, names, types, order, flex_set, manual_mask, limit, greedy,
+        start_idx, max_step, pw, rank_of, unit,
     )
-    t_now = ts[end].strftime("%Y-%m-%d %H:%M")
-    status = int(res["status"][-1])
-    ratio_dec = res["d_dec"][-1] / limit * 100
-    raw_now = res["raw"][-1]
-    cut_now = res["cut"][-1]
-
-    how = " (우선순위대로 P_warn 아래까지)" if greedy else " (대상 전부)"
-    if status == 0:
-        st.success(f"🟢 **[{t_now} 정상]** 이번 15분 구간 예상 수요율 {ratio_dec:.1f}% - 개입 없음")
-    elif status == 1:
-        st.warning(f"🟡 **[{t_now} 경고]** 예상 수요율 {ratio_dec:.1f}% (≥ P_warn {pw:,.0f}{unit}) - 유연부하 차단{how}")
-    else:
-        st.error(
-            f"🔴 **[{t_now} 비상]** 예상 수요율 {ratio_dec:.1f}% (≥100% 한계값) - 유연부하 차단 + 탄력부하 15분 지연{how}"
-        )
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("현재 전력 (1분)", f"{raw_now:,.0f} {unit}")
-    c2.metric("피크 한계값", f"{limit:,.0f} {unit}")
-    c3.metric(
-        "구간 예상 수요 (무제어)", f"{res['proj_raw'][-1]:,.0f} {unit}",
-        delta=f"{res['proj_raw'][-1] / limit * 100:.0f}% of 한계",
-        delta_color="off",
-    )
-    c4.metric(
-        "구간 예상 수요 (제어 후)", f"{res['proj_ctrl'][-1]:,.0f} {unit}",
-        delta=f"{res['proj_ctrl'][-1] / limit * 100:.0f}% of 한계",
-        delta_color="off",
-    )
-    c5.metric(
-        "현재 감축 전력", f"{cut_now:,.0f} {unit}",
-        delta=f"-{cut_now:,.0f} {unit}" if cut_now > 0 else None,
-    )
-
-    # ---- 그래프 ----
-    col_chart, col_gauge = st.columns([2, 1])
-    with col_chart:
-        lo = max(0, len(res["raw"]) - WINDOW_MIN)
-        x = list(ts[start_idx + lo:end + 1])
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=x, y=res["raw"][lo:], mode="lines", name="측정 전력 (1분)",
-                                 line=dict(color="red", width=2)))
-        fig.add_trace(go.Scatter(x=x, y=res["ctrl"][lo:], mode="lines", name="제어 후 전력 (1분)",
-                                 line=dict(color="green", width=2, dash="dash")))
-        fig.add_hline(y=limit, line_dash="solid", line_color="black",
-                      annotation_text=f"P_max {limit:,.0f} (15분 평균 기준)")
-        fig.add_hline(y=pw, line_dash="dot", line_color="orange",
-                      annotation_text=f"P_warn {pw:,.0f}",
-                      annotation_position="bottom right")
-        # P_peak max/min은 서로 5kW 차이라 글씨가 겹치므로 범례로 표시
-        for val, name, color in ((P_PEAKMAX_KW, "P_peak max", "purple"),
-                                 (P_PEAKMIN_KW, "P_peak min", "deepskyblue")):
-            fig.add_trace(go.Scatter(x=x, y=[val] * len(x), mode="lines", name=f"{name} {val:,.1f}",
-                                     line=dict(color=color, width=1.5, dash="dot"), hoverinfo="skip"))
-        fig.update_layout(title="📈 1분 전력 추이 (최근 60분)", xaxis_title="시각",
-                          yaxis_title=f"전력 ({unit})", height=330)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_gauge:
-        val = float(res["proj_raw"][-1])
-        gmax = max(limit * 1.2, val * 1.1)
-        fig_g = go.Figure(go.Indicator(
-            mode="gauge+number", value=val,
-            gauge={
-                "axis": {"range": [0, gmax]},
-                "bar": {"color": "darkblue"},
-                "steps": [
-                    {"range": [0, pw], "color": "lightgreen"},
-                    {"range": [pw, limit * EMERG_RATIO], "color": "yellow"},
-                    {"range": [limit * EMERG_RATIO, gmax], "color": "salmon"},
-                ],
-                "threshold": {"line": {"color": "red", "width": 4}, "value": limit},
-            },
-        ))
-        fig_g.update_layout(title="구간 예상 수요 (무제어 기준)", height=330)
-        st.plotly_chart(fig_g, use_container_width=True)
-
-    labels, raw_m, ctrl_m = block_series(res, mib[start_idx:end + 1], ts[start_idx:end + 1], WINDOW_BLOCKS)
-    fig_b = go.Figure()
-    fig_b.add_trace(go.Bar(x=labels, y=raw_m, name="제어 전 15분 수요", marker_color="red"))
-    fig_b.add_trace(go.Bar(x=labels, y=ctrl_m, name="제어 후 15분 수요", marker_color="green"))
-    # P_peak range: 폭이 5.5kW라 얇으므로 막대 위에 반투명으로 칠하고, 이름은 P_warn 글씨와 겹치지 않게 범례로 표시
-    fig_b.add_hrect(y0=P_PEAKMIN_KW, y1=P_PEAKMAX_KW, fillcolor="rgba(147, 112, 219, 0.55)", line_width=0,
-                    layer="above")
-    fig_b.add_trace(go.Scatter(x=[None], y=[None], mode="markers", hoverinfo="skip",
-                               marker=dict(symbol="square", size=14, color="rgba(147, 112, 219, 0.55)"),
-                               name=f"P_peak range {P_PEAKMIN_KW:,.1f}~{P_PEAKMAX_KW:,.1f}"))
-    fig_b.add_hline(y=limit, line_dash="solid", line_color="black",
-                    annotation_text=f"P_max {limit:,.0f}")
-    fig_b.add_hline(y=pw, line_dash="dot", line_color="orange",
-                    annotation_text=f"P_warn {pw:,.0f}", annotation_position="bottom left")
-    y_top = max([limit] + raw_m + ctrl_m) * 1.01  # P_max 선이 보이도록 1% 여유, 넘는 막대가 있으면 그만큼 확장
-    fig_b.update_layout(title="📊 15분 구간 수요전력 (요금 산정 기준, 진행 중 구간은 현재까지 평균)",
-                        barmode="group", yaxis_title=f"전력 ({unit})", yaxis_range=[2500, y_top], height=330)
-    st.plotly_chart(fig_b, use_container_width=True)
-
-    # ---- 의사결정 로그 ----
-    st.subheader("🤖 수동 조작 및 AI 실시간 의사결정 로그 (현재 시점)")
-    p_now = P[end]
-    rows = []
-    for i, c in enumerate(names):
-        if manual_mask[i] and p_now[i] > 0:
-            rows.append(["-", c, "OFF (수동 차단)", "수동 개입", round(p_now[i], 1), round(p_now[i], 1),
-                         "관리자 수동 차단"])
-    for i, kind, r in res["actions"]:
-        label, why = ACTION_TEXT[kind]
-        rows.append([str(rank_of[i]), names[i], label, types[names[i]], round(p_now[i], 1), round(r, 1), why])
-    if rows:
-        df_act = pd.DataFrame(
-            rows, columns=["순위", "대상 설비", "제어 상태", "부하 유형", f"현재 전력({unit})",
-                           f"감축량({unit})", "제어 사유"]
-        )
-        st.dataframe(df_act, use_container_width=True, hide_index=True)
-    else:
-        st.info("현재 제어 중인 설비가 없습니다.")
 
     # ---- 부가 정보 ----
     with st.expander("🧩 부하 분류 결과 (K-Means 군집 + DBSCAN 이상 설비 검토 + 관리자 확정)"):
@@ -699,15 +730,6 @@ def main():
             s4.metric("WARNING 이상 (제어 발동) 구간", f"{r['warn_blocks']} ({r['warn_blocks'] / r['blocks'] * 100:.2f}%)")
             s5.metric("EMERGENCY (탄력 지연 포함) 구간", f"{r['emerg_blocks']} ({r['emerg_blocks'] / r['blocks'] * 100:.2f}%)")
             s6.metric("감축 에너지", f"{r['energy_cut_kwh']:,.1f} kWh ({r['energy_cut_kwh'] / r['energy_raw_kwh'] * 100:.2f}%)")
-
-    # ---- 재생 루프 ----
-    if ss.is_running:
-        time.sleep(speed)
-        if ss.current_step < max_step:
-            ss.current_step += 1
-        else:
-            ss.is_running = False
-        st.rerun()
 
 
 if __name__ == "__main__":
